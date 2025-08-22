@@ -1,0 +1,881 @@
+```text
+# Project: webrtc-fastapi-postgres
+# Purpose: Minimal yet complete starter for auth, chat (personal/group), and WebRTC video (P2P/mesh) using FastAPI + Postgres + Docker. Includes optional TURN (coturn) and a Vite + React frontend.
+# -------------------------------------------------------------------------------------------------
+# FILE: docker-compose.yml
+# -------------------------------------------------------------------------------------------------
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    container_name: webrtc_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build: ./backend
+    container_name: webrtc_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 43200 # 30 days for dev
+      STUN_SERVERS: ${STUN_SERVERS:-stun:stun.l.google.com:19302}
+      TURN_URI: ${TURN_URI:-}
+      TURN_USERNAME: ${TURN_USERNAME:-}
+      TURN_PASSWORD: ${TURN_PASSWORD:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+
+  # Optional TURN server for NAT traversal. For local same-network testing, STUN may be enough.
+  # Uncomment if you want to run coturn locally. Replace EXTERNAL_IP with your public IP for remote peers.
+  # turn:
+  #   image: coturn/coturn:latest
+  #   container_name: webrtc_turn
+  #   restart: unless-stopped
+  #   command: >-
+  #     turnserver -n --log-file=stdout \
+  #     --realm=webrtc.local \
+  #     --listening-ip=0.0.0.0 \
+  #     --min-port=49160 --max-port=49200 \
+  #     --user=${TURN_USERNAME?set in .env}:${TURN_PASSWORD?set in .env} \
+  #     --no-cli --no-tls --no-dtls
+  #   ports:
+  #     - "3478:3478/udp"
+  #     - "3478:3478/tcp"
+  #     - "49160-49200:49160-49200/udp"
+
+  frontend:
+    build: ./frontend
+    container_name: webrtc_frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      VITE_API_BASE: ${VITE_API_BASE:-http://localhost:8000}
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+
+# -------------------------------------------------------------------------------------------------
+# FILE: .env.example  (copy to .env and adjust)
+# -------------------------------------------------------------------------------------------------
+POSTGRES_DB=webrtc
+POSTGRES_USER=webrtc
+POSTGRES_PASSWORD=webrtc
+JWT_SECRET_KEY=supersecret_change_me
+VITE_API_BASE=http://localhost:8000
+# Comma-separated list of origins allowed for CORS
+CORS_ORIGINS=http://localhost:5173
+# STUN only (ok for local dev). To use your own TURN, fill below and set TURN_URI=turn:localhost:3478
+STUN_SERVERS=stun:stun.l.google.com:19302
+TURN_URI=
+TURN_USERNAME=
+TURN_PASSWORD=
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/Dockerfile
+# -------------------------------------------------------------------------------------------------
+FROM python:3.11-slim
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev && rm -rf /var/lib/apt/lists/*
+COPY backend/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY backend /app
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/requirements.txt
+# -------------------------------------------------------------------------------------------------
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+SQLAlchemy[asyncio]==2.0.36
+asyncpg==0.29.0
+passlib[bcrypt]==1.7.4
+PyJWT==2.9.0
+python-multipart==0.0.9
+pydantic-settings==2.5.2
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/__init__.py
+# -------------------------------------------------------------------------------------------------
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/config.py
+# -------------------------------------------------------------------------------------------------
+from pydantic_settings import BaseSettings
+from pydantic import AnyHttpUrl
+from typing import List
+
+class Settings(BaseSettings):
+    database_url: str
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60 * 24 * 30
+    stun_servers: str = "stun:stun.l.google.com:19302"
+    turn_uri: str | None = None
+    turn_username: str | None = None
+    turn_password: str | None = None
+    cors_origins: str = "http://localhost:5173"
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+
+settings = Settings(
+    database_url=None,  # filled by env var DATABASE_URL
+    jwt_secret_key=None,
+)
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/db.py
+# -------------------------------------------------------------------------------------------------
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import DeclarativeBase
+from .config import settings
+
+engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+async def init_db():
+    from . import models  # noqa
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/models.py
+# -------------------------------------------------------------------------------------------------
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import Integer, String, Text, ForeignKey, DateTime, func, Boolean
+from .db import Base
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class Room(Base):
+    __tablename__ = "rooms"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(120))
+
+class RoomMember(Base):
+    __tablename__ = "room_members"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    room_id: Mapped[int] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+
+class Message(Base):
+    __tablename__ = "messages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    room_id: Mapped[int] = mapped_column(ForeignKey("rooms.id", ondelete="CASCADE"), index=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/schemas.py
+# -------------------------------------------------------------------------------------------------
+from pydantic import BaseModel, EmailStr
+from datetime import datetime
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    display_name: str
+
+class UserOut(BaseModel):
+    id: int
+    email: EmailStr
+    display_name: str
+    class Config:
+        from_attributes = True
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class RoomCreate(BaseModel):
+    title: str
+
+class RoomOut(BaseModel):
+    id: int
+    slug: str
+    title: str
+    class Config:
+        from_attributes = True
+
+class MessageOut(BaseModel):
+    id: int
+    room_id: int
+    sender_id: int | None
+    content: str
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/auth.py
+# -------------------------------------------------------------------------------------------------
+import time
+import jwt
+from passlib.context import CryptContext
+from fastapi import HTTPException, status, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from .config import settings
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer(auto_error=False)
+
+# Why: Strong hashing and signed tokens are essential for auth in production.
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def create_access_token(sub: str, expires_minutes: int | None = None) -> str:
+    payload = {
+        "sub": sub,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 60 * (expires_minutes or settings.access_token_expire_minutes),
+    }
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+async def get_current_user_id(creds: HTTPAuthorizationCredentials | None = Depends(security)) -> int:
+    if not creds:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    data = decode_token(creds.credentials)
+    return int(data["sub"])  # user id
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/rooms.py  (in-memory presence for signaling)
+# -------------------------------------------------------------------------------------------------
+from typing import Dict
+from fastapi import WebSocket
+from collections import defaultdict
+
+class RoomPresence:
+    def __init__(self) -> None:
+        self.rooms: Dict[str, dict[int, WebSocket]] = defaultdict(dict)
+
+    def add(self, room_slug: str, user_id: int, ws: WebSocket):
+        self.rooms[room_slug][user_id] = ws
+
+    def remove(self, room_slug: str, user_id: int):
+        if room_slug in self.rooms and user_id in self.rooms[room_slug]:
+            self.rooms[room_slug].pop(user_id, None)
+            if not self.rooms[room_slug]:
+                self.rooms.pop(room_slug, None)
+
+    def peers(self, room_slug: str) -> list[int]:
+        return list(self.rooms.get(room_slug, {}).keys())
+
+    def get_ws(self, room_slug: str, user_id: int) -> WebSocket | None:
+        return self.rooms.get(room_slug, {}).get(user_id)
+
+    def all(self, room_slug: str) -> dict[int, WebSocket]:
+        return self.rooms.get(room_slug, {})
+
+presence = RoomPresence()
+
+# -------------------------------------------------------------------------------------------------
+# FILE: backend/app/main.py
+# -------------------------------------------------------------------------------------------------
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from .config import settings
+from .db import SessionLocal, init_db
+from .models import User, Room, RoomMember, Message
+from .schemas import UserCreate, UserOut, LoginIn, Token, RoomCreate, RoomOut, MessageOut
+from .auth import get_password_hash, verify_password, create_access_token, get_current_user_id, decode_token
+from .rooms import presence
+import secrets
+import json
+
+app = FastAPI(title="WebRTC + Chat Backend")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in settings.cors_origins.split(",")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Dependency
+async def get_db():
+    async with SessionLocal() as session:
+        yield session
+
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# ---------------------- AUTH ----------------------
+@app.post("/auth/register", response_model=UserOut)
+async def register(payload: UserCreate, db: AsyncSession = Depends(get_db)):
+    user = User(email=payload.email, password_hash=get_password_hash(payload.password), display_name=payload.display_name)
+    db.add(user)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Email already registered")
+    await db.refresh(user)
+    return user
+
+@app.post("/auth/login", response_model=Token)
+async def login(payload: LoginIn, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(User).where(User.email == payload.email))
+    user = res.scalar_one_or_none()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+    token = create_access_token(str(user.id))
+    return Token(access_token=token)
+
+@app.get("/me", response_model=UserOut)
+async def me(user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    res = await db.get(User, user_id)
+    return UserOut.model_validate(res)
+
+# ---------------------- ROOMS ----------------------
+@app.post("/rooms", response_model=RoomOut)
+async def create_room(body: RoomCreate, user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    slug = secrets.token_urlsafe(6)
+    room = Room(slug=slug, title=body.title)
+    db.add(room)
+    await db.flush()
+    db.add(RoomMember(room_id=room.id, user_id=user_id))
+    await db.commit()
+    await db.refresh(room)
+    return room
+
+@app.get("/rooms/{slug}", response_model=RoomOut)
+async def get_room(slug: str, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Room).where(Room.slug == slug))
+    room = res.scalar_one_or_none()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return room
+
+@app.post("/rooms/{slug}/join")
+async def join_room(slug: str, user_id: int = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(Room).where(Room.slug == slug))
+    room = res.scalar_one_or_none()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    exists = await db.execute(select(RoomMember).where(RoomMember.room_id == room.id, RoomMember.user_id == user_id))
+    if not exists.scalar_one_or_none():
+        db.add(RoomMember(room_id=room.id, user_id=user_id))
+        await db.commit()
+    return {"ok": True}
+
+@app.get("/rooms/{slug}/peers")
+async def list_peers(slug: str):
+    return {"peers": presence.peers(slug)}
+
+@app.get("/rtc/config")
+async def rtc_config():
+    ice_servers = []
+    if settings.stun_servers:
+        for stun in settings.stun_servers.split(","):
+            ice_servers.append({"urls": stun.strip()})
+    if settings.turn_uri and settings.turn_username and settings.turn_password:
+        ice_servers.append({
+            "urls": settings.turn_uri,
+            "username": settings.turn_username,
+            "credential": settings.turn_password,
+        })
+    return {"iceServers": ice_servers}
+
+# ---------------------- WEBSOCKETS ----------------------
+# Signaling WS: relays offers/answers/candidates and announces join/leave. Also supports targeted personal signaling via `to`.
+@app.websocket("/ws/signaling/{slug}")
+async def ws_signaling(ws: WebSocket, slug: str):
+    token = ws.query_params.get("token")
+    if not token:
+        await ws.close(code=4401)
+        return
+    try:
+        data = decode_token(token)
+        user_id = int(data["sub"])
+    except Exception:
+        await ws.close(code=4401)
+        return
+
+    await ws.accept()
+    presence.add(slug, user_id, ws)
+
+    # notify others
+    for peer_id, peer_ws in presence.all(slug).items():
+        if peer_id != user_id:
+            await peer_ws.send_text(json.dumps({"type": "peer-joined", "user_id": user_id}))
+
+    # send current peers to the new user
+    await ws.send_text(json.dumps({"type": "peers", "peers": [pid for pid in presence.peers(slug) if pid != user_id]}))
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            mtype = msg.get("type")
+            if mtype == "signal":
+                to_id = int(msg["to"])  # required for targeted signaling
+                target = presence.get_ws(slug, to_id)
+                if target:
+                    await target.send_text(json.dumps({
+                        "type": "signal",
+                        "signal_type": msg.get("signal_type"),
+                        "from": user_id,
+                        "data": msg.get("data"),
+                    }))
+            elif mtype == "ping":
+                await ws.send_text(json.dumps({"type": "pong"}))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        presence.remove(slug, user_id)
+        for peer_id, peer_ws in presence.all(slug).items():
+            await peer_ws.send_text(json.dumps({"type": "peer-left", "user_id": user_id}))
+
+# Chat WS: broadcast to room + persist in DB.
+@app.websocket("/ws/chat/{slug}")
+async def ws_chat(ws: WebSocket, slug: str):
+    token = ws.query_params.get("token")
+    if not token:
+        await ws.close(code=4401)
+        return
+    try:
+        data = decode_token(token)
+        user_id = int(data["sub"])
+    except Exception:
+        await ws.close(code=4401)
+        return
+
+    await ws.accept()
+    presence.add(f"chat:{slug}", user_id, ws)
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            if msg.get("type") == "chat":
+                content = str(msg.get("content", ""))[:4000]
+                # persist
+                async with SessionLocal() as db:
+                    res = await db.execute(select(Room).where(Room.slug == slug))
+                    room = res.scalar_one_or_none()
+                    if room:
+                        m = Message(room_id=room.id, sender_id=user_id, content=content)
+                        db.add(m)
+                        await db.commit()
+                        await db.refresh(m)
+                        payload = {
+                            "type": "chat",
+                            "id": m.id,
+                            "room_id": room.id,
+                            "sender_id": user_id,
+                            "content": m.content,
+                            "created_at": m.created_at.isoformat(),
+                        }
+                        # broadcast
+                        for peer_id, peer_ws in presence.all(f"chat:{slug}").items():
+                            await peer_ws.send_text(json.dumps(payload))
+            else:
+                await ws.send_text(json.dumps({"type": "error", "message": "unknown message"}))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        presence.remove(f"chat:{slug}", user_id)
+
+# -------------------------------------------------------------------------------------------------
+# FILE: frontend/Dockerfile
+# -------------------------------------------------------------------------------------------------
+FROM node:20-alpine
+WORKDIR /app
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend /app
+EXPOSE 5173
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+# -------------------------------------------------------------------------------------------------
+# FILE: frontend/package.json
+# -------------------------------------------------------------------------------------------------
+{
+  "name": "webrtc-frontend",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 5173"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.6"
+  }
+}
+
+# -------------------------------------------------------------------------------------------------
+# FILE: frontend/index.html
+# -------------------------------------------------------------------------------------------------
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC + Chat</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Ubuntu, Cantarell; margin: 0; }
+      .wrap { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
+      .sidebar { border-right: 1px solid #eee; padding: 16px; }
+      .main { padding: 16px; display: grid; grid-template-rows: 1fr auto; gap: 12px; }
+      .videos { display: flex; flex-wrap: wrap; gap: 8px; }
+      video { width: 320px; background: #000; border-radius: 8px; }
+      .chat { border: 1px solid #eee; border-radius: 8px; display: grid; grid-template-rows: 1fr auto; }
+      .msgs { padding: 8px; overflow: auto; }
+      .msg { margin-bottom: 8px; }
+      .msg .meta { color: #666; font-size: 12px; }
+      .input { display: flex; gap: 8px; padding: 8px; border-top: 1px solid #eee; }
+      input, button { padding: 8px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+# -------------------------------------------------------------------------------------------------
+# FILE: frontend/src/main.tsx
+# -------------------------------------------------------------------------------------------------
+import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+
+# -------------------------------------------------------------------------------------------------
+# FILE: frontend/src/App.tsx
+# -------------------------------------------------------------------------------------------------
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import axios from "axios";
+
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+
+function useLocalStorage<T>(key: string, initial: T) {
+  const [val, setVal] = useState<T>(() => {
+    const v = localStorage.getItem(key);
+    return v ? (JSON.parse(v) as T) : initial;
+  });
+  useEffect(() => localStorage.setItem(key, JSON.stringify(val)), [key, val]);
+  return [val, setVal] as const;
+}
+
+type PeerInfo = { id: number };
+
+type Signal = {
+  type: "signal";
+  signal_type: "offer" | "answer" | "ice";
+  from: number;
+  data: any;
+};
+
+export default function App() {
+  const [email, setEmail] = useLocalStorage("email", "user@demo.dev");
+  const [password, setPassword] = useLocalStorage("password", "password");
+  const [displayName, setDisplayName] = useLocalStorage("displayName", "User");
+  const [token, setToken] = useLocalStorage<string | null>("token", null);
+  const [me, setMe] = useState<{ id: number; email: string; display_name: string } | null>(null);
+
+  const [roomTitle, setRoomTitle] = useState("Demo Room");
+  const [roomSlug, setRoomSlug] = useLocalStorage<string | null>("room", null);
+
+  const [chatInput, setChatInput] = useState("");
+  const [messages, setMessages] = useState<any[]>([]);
+
+  const [iceServers, setIceServers] = useState<any[]>([]);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const [streams, setStreams] = useState<Record<number, MediaStream>>({});
+
+  const peersRef = useRef<Map<number, RTCPeerConnection>>(new Map());
+  const chatSocketRef = useRef<WebSocket | null>(null);
+  const sigSocketRef = useRef<WebSocket | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    axios
+      .get(`${API_BASE}/me`, { headers: { Authorization: `Bearer ${token}` } })
+      .then((r) => setMe(r.data))
+      .catch(() => setMe(null));
+  }, [token]);
+
+  useEffect(() => {
+    axios.get(`${API_BASE}/rtc/config`).then((r) => setIceServers(r.data.iceServers || []));
+  }, []);
+
+  async function register() {
+    await axios.post(`${API_BASE}/auth/register`, { email, password, display_name: displayName });
+    await login();
+  }
+
+  async function login() {
+    const r = await axios.post(`${API_BASE}/auth/login`, { email, password });
+    setToken(r.data.access_token);
+  }
+
+  async function createRoom() {
+    if (!token) return;
+    const r = await axios.post(
+      `${API_BASE}/rooms`,
+      { title: roomTitle },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    setRoomSlug(r.data.slug);
+  }
+
+  async function joinRoom() {
+    if (!token || !roomSlug) return;
+    await axios.post(
+      `${API_BASE}/rooms/${roomSlug}/join`,
+      {},
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    await startSession();
+  }
+
+  async function startSession() {
+    if (!token || !roomSlug) return;
+
+    const local = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localStreamRef.current = local;
+    if (localVideoRef.current) {
+      localVideoRef.current.srcObject = local;
+      localVideoRef.current.muted = true;
+      await localVideoRef.current.play();
+    }
+
+    const sig = new WebSocket(`${API_BASE.replace("http", "ws")}/ws/signaling/${roomSlug}?token=${token}`);
+    const chat = new WebSocket(`${API_BASE.replace("http", "ws")}/ws/chat/${roomSlug}?token=${token}`);
+    sigSocketRef.current = sig;
+    chatSocketRef.current = chat;
+
+    sig.onmessage = async (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "peers") {
+        for (const pid of msg.peers as number[]) {
+          await ensurePeer(pid, true);
+        }
+      } else if (msg.type === "peer-joined") {
+        await ensurePeer(msg.user_id, true);
+      } else if (msg.type === "peer-left") {
+        const pc = peersRef.current.get(msg.user_id);
+        pc?.close();
+        peersRef.current.delete(msg.user_id);
+        setStreams((s) => {
+          const n = { ...s };
+          delete n[msg.user_id];
+          return n;
+        });
+      } else if (msg.type === "signal") {
+        await handleSignal(msg as Signal);
+      }
+    };
+
+    chat.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.type === "chat") setMessages((prev) => [...prev, m]);
+    };
+  }
+
+  async function ensurePeer(peerId: number, isInitiator: boolean) {
+    if (!me || peersRef.current.has(peerId) || peerId === me.id) return;
+
+    const pc = new RTCPeerConnection({ iceServers });
+    peersRef.current.set(peerId, pc);
+
+    localStreamRef.current?.getTracks().forEach((t) => pc.addTrack(t, localStreamRef.current!));
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate)
+        sigSocketRef.current?.send(
+          JSON.stringify({
+            type: "signal",
+            signal_type: "ice",
+            to: peerId,
+            data: ev.candidate,
+          })
+        );
+    };
+
+    pc.ontrack = (ev) => {
+      setStreams((prev) => ({ ...prev, [peerId]: ev.streams[0] }));
+    };
+
+    if (isInitiator) {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      sigSocketRef.current?.send(
+        JSON.stringify({ type: "signal", signal_type: "offer", to: peerId, data: offer })
+      );
+    }
+  }
+
+  async function handleSignal(msg: Signal) {
+    const from = msg.from;
+    const pc = peersRef.current.get(from) || (await (async () => { await ensurePeer(from, false); return peersRef.current.get(from)!; })());
+
+    if (msg.signal_type === "offer") {
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.data));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      sigSocketRef.current?.send(
+        JSON.stringify({ type: "signal", signal_type: "answer", to: from, data: answer })
+      );
+    } else if (msg.signal_type === "answer") {
+      if (!pc.currentRemoteDescription) await pc.setRemoteDescription(new RTCSessionDescription(msg.data));
+    } else if (msg.signal_type === "ice") {
+      try { await pc.addIceCandidate(new RTCIceCandidate(msg.data)); } catch {}
+    }
+  }
+
+  function sendChat() {
+    if (!chatSocketRef.current || !me || !chatInput) return;
+    chatSocketRef.current.send(JSON.stringify({ type: "chat", content: chatInput }));
+    setChatInput("");
+  }
+
+  return (
+    <div className="wrap">
+      <aside className="sidebar">
+        <h3>Auth</h3>
+        <div>
+          <input placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <input placeholder="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+          <input placeholder="Display name" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button onClick={register}>Register</button>
+            <button onClick={login}>Login</button>
+          </div>
+        </div>
+        <hr />
+        <h3>Room</h3>
+        <div>
+          <input placeholder="Room title" value={roomTitle} onChange={(e) => setRoomTitle(e.target.value)} />
+          <button onClick={createRoom} disabled={!token}>Create</button>
+        </div>
+        <div>
+          <input placeholder="Room slug" value={roomSlug ?? ""} onChange={(e) => setRoomSlug(e.target.value)} />
+          <button onClick={joinRoom} disabled={!token || !roomSlug}>Join</button>
+        </div>
+        <div style={{ marginTop: 8, fontSize: 12, color: "#666" }}>
+          {me ? `Logged in as #${me.id} ${me.display_name}` : "Not logged in"}
+        </div>
+      </aside>
+
+      <main className="main">
+        <section className="videos">
+          <video ref={localVideoRef} playsInline autoPlay muted></video>
+          {Object.entries(streams).map(([uid, stream]) => (
+            <video key={uid} playsInline autoPlay ref={(el) => el && (el.srcObject = stream)}></video>
+          ))}
+        </section>
+        <section className="chat">
+          <div className="msgs">
+            {messages.map((m, i) => (
+              <div className="msg" key={i}>
+                <div className="meta">#{m.sender_id} · {new Date(m.created_at).toLocaleTimeString()}</div>
+                <div>{m.content}</div>
+              </div>
+            ))}
+          </div>
+          <div className="input">
+            <input
+              placeholder="Type a message"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendChat()}
+            />
+            <button onClick={sendChat}>Send</button>
+          </div>
+        </section>
+      </main>
+    </div>
+  );
+}
+
+# -------------------------------------------------------------------------------------------------
+# HOW TO RUN (DEV)
+# -------------------------------------------------------------------------------------------------
+# 1) Save all files to a folder, e.g., webrtc-fastapi-postgres
+# 2) Copy .env.example -> .env and edit as needed
+# 3) docker compose up --build
+# 4) Open http://localhost:5173, register, login, create a room, copy the slug, open another browser/tab and join.
+# 5) For remote peers/NAT, configure TURN: uncomment 'turn' service and fill TURN_* in .env, then set TURN_URI=turn:your-ip:3478
+#    Also ensure ports 3478/udp and 49160-49200/udp are reachable.
+# -------------------------------------------------------------------------------------------------
+```

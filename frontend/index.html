@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC + Chat</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Noto Sans, Ubuntu, Cantarell; margin: 0; }
+      .wrap { display: grid; grid-template-columns: 320px 1fr; height: 100vh; }
+      .sidebar { border-right: 1px solid #eee; padding: 16px; }
+      .main { padding: 16px; display: grid; grid-template-rows: 1fr auto; gap: 12px; }
+      .videos { display: flex; flex-wrap: wrap; gap: 8px; }
+      video { width: 320px; background: #000; border-radius: 8px; }
+      .chat { border: 1px solid #eee; border-radius: 8px; display: grid; grid-template-rows: 1fr auto; }
+      .msgs { padding: 8px; overflow: auto; }
+      .msg { margin-bottom: 8px; }
+      .msg .meta { color: #666; font-size: 12px; }
+      .input { display: flex; gap: 8px; padding: 8px; border-top: 1px solid #eee; }
+      input, button { padding: 8px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
